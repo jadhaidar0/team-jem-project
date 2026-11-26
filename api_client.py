@@ -1,52 +1,133 @@
 """
-api_client.py  --  ALL calls to your external API live here (one place).
-
-RIGHT NOW this returns a few SAMPLE items so the app runs out of the box.
-TODO (your team): replace the sample data with real calls to your chosen free
-API, keeping the SAME return shapes so the rest of the app keeps working:
-
-    search(query)   -> a list of dicts, each: {"id", "title", "image"}
-    get_item(id)    -> one dict: {"id", "title", "image", "description"}
+api_client.py
+All communication with the Radio Browser API lives in this module.
+Routes never call `requests` directly; they call the functions below.
 """
-import requests  # you'll use this for the real API calls
 
-TIMEOUT = 6  # seconds; give up instead of hanging if the API is slow
+import logging
 
-# ----- temporary sample data (delete once your API works) -----
-_SAMPLE = [
-    {"id": "1", "title": "Example Item One",
-     "image": "https://picsum.photos/id/1011/400/300",
-     "description": "Replace this with a real description from your API."},
-    {"id": "2", "title": "Example Item Two",
-     "image": "https://picsum.photos/id/1025/400/300",
-     "description": "Replace this with a real description from your API."},
-    {"id": "3", "title": "Example Item Three",
-     "image": "https://picsum.photos/id/1039/400/300",
-     "description": "Replace this with a real description from your API."},
-]
+import requests
+import random
+logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# 1. Configuration
+# ---------------------------------------------------------------------------
+BASE_URL = "https://de1.api.radio-browser.info/json/"
+TIMEOUT = 5  # seconds
+HEADERS = {"User-Agent": "RadioPassport/1.0 (GIN446 Group 06)"}
+PAGE_SIZE = 30
 
-def search(query):
-    """Return a list of items matching the query."""
-    # TODO: call your API instead, e.g.
-    #   r = requests.get("https://api.example.com/search",
-    #                    params={"q": query}, timeout=TIMEOUT)
-    #   if r.status_code != 200:
-    #       return []
-    #   data = r.json()
-    #   return [{"id": x["id"], "title": x["name"], "image": x["thumb"]}
-    #           for x in data["results"]]
-    q = query.lower()
-    hits = [it for it in _SAMPLE if q in it["title"].lower()]
-    return hits or _SAMPLE
+# The only station fields the app uses.
+STATION_FIELDS = (
+    "stationuuid", "name", "url_resolved", "favicon", "country",
+    "countrycode", "tags", "language", "codec", "bitrate", "votes",
+    "clickcount", "lastcheckok", "homepage",
+)
 
 
-def get_item(item_id):
-    """Return one item by its id, or None if not found."""
-    # TODO: call your API for one item, e.g.
-    #   r = requests.get(f"https://api.example.com/item/{item_id}", timeout=TIMEOUT)
-    #   ...
-    for it in _SAMPLE:
-        if it["id"] == item_id:
-            return it
-    return None
+# ---------------------------------------------------------------------------
+# 2. Custom error
+# ---------------------------------------------------------------------------
+class ApiError(Exception):
+    """Raised when the Radio Browser API cannot be reached or answers badly."""
+
+
+# ---------------------------------------------------------------------------
+# 3. Private helpers
+# ---------------------------------------------------------------------------
+def _get(path, params=None):
+    """Send one GET request to the API and return the decoded JSON."""
+    url = BASE_URL + path.lstrip("/")
+    try:
+        response = requests.get(url, params=params, headers=HEADERS, timeout=TIMEOUT)
+        response.raise_for_status()
+        return response.json()
+    except requests.Timeout as exc:
+        raise ApiError("The radio service took too long to answer.") from exc
+    except requests.ConnectionError as exc:
+        raise ApiError("Could not connect to the radio service.") from exc
+    except requests.HTTPError as exc:
+        raise ApiError(f"The radio service returned an error ({response.status_code}).") from exc
+    except (requests.RequestException, ValueError) as exc:
+        raise ApiError("The radio service sent an unexpected answer.") from exc
+
+
+def _clean_station(raw):
+    """Keep only the fields listed in STATION_FIELDS."""
+    return {field: raw.get(field) for field in STATION_FIELDS}
+
+
+# ---------------------------------------------------------------------------
+# 4. Public functions
+# ---------------------------------------------------------------------------
+def search_stations(name=None, countrycode=None, tag=None, page=1,
+                    order="votes", reverse=True):
+    """Return one page (up to 30) of working, https stations."""
+    params = {
+        "name": name or None,
+        "countrycode": countrycode.upper() if countrycode else None,
+        "tag": tag or None,
+        "is_https": "true",
+        "hidebroken": "true",
+        "order": order,
+        "reverse": "true" if reverse else "false",
+        "limit": PAGE_SIZE,
+        "offset": (page - 1) * PAGE_SIZE,
+    }
+    data = _get("stations/search", params)
+    return [_clean_station(s) for s in data]
+
+
+def get_countries():
+    """Return all countries, most stations first: [{name, code, stationcount}]."""
+    data = _get("countries", {"order": "stationcount", "reverse": "true"})
+    return [
+        {"name": c.get("name"), "code": c.get("iso_3166_1"),
+         "stationcount": c.get("stationcount", 0)}
+        for c in data
+        if c.get("iso_3166_1")
+    ]
+
+
+def get_genres():
+    """Return the 50 most popular genres: [{name, stationcount}]."""
+    data = _get("tags", {
+        "order": "stationcount",
+        "reverse": "true",
+        "hidebroken": "true",
+        "limit": 50,
+    })
+    return [{"name": t.get("name"), "stationcount": t.get("stationcount", 0)}
+            for t in data]
+
+
+def get_station(uuid):
+    """Return one station dict, or None if the UUID is unknown."""
+    data = _get(f"stations/byuuid/{uuid}")
+    if not data:
+        return None
+    return _clean_station(data[0])
+
+
+def register_click(uuid):
+    """Tell the API a station was played. Never raises; returns True/False."""
+    try:
+        data = _get(f"url/{uuid}")
+        return bool(data.get("ok"))
+    except ApiError as exc:
+        logger.warning("register_click failed for %s: %s", uuid, exc)
+        return False
+
+
+def get_random_station():
+    """Return one random working https station, or None."""
+    data = _get("stations/search", {
+        "is_https": "true",
+        "hidebroken": "true",
+        "order": "random",
+        "limit": 100,
+    })
+    if not data:
+        return None
+    return _clean_station(random.choice(data))
